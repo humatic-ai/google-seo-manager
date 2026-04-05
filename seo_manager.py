@@ -791,31 +791,30 @@ def _inspect_urls_parallel(
         return status
 
     result_map: dict[str, UrlStatus] = {}
-    done_count = 0
-    total = len(urls)
-    print_lock = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_worker, url): url for url in urls}
-        for future in as_completed(futures):
-            url = futures[future]
-            try:
-                status = future.result()
-            except Exception as exc:
-                status = UrlStatus(url=url, http_error=str(exc))
-            result_map[url] = status
-            done_count += 1
-            cov = status.coverage_state or "unknown"
-            with print_lock:
-                if _is_indexed_coverage(cov):
-                    mark = "[green]✓[/green]"
-                elif _is_error_coverage(cov):
-                    mark = "[red]✗[/red]"
-                else:
-                    mark = "[yellow]○[/yellow]"
-                parsed = urlparse(url)
-                short = parsed.path.rstrip("/") or "/"
-                console.print(f"  [{done_count}/{total}] {mark} {short}  [dim]{cov}[/dim]")
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[dim]{task.fields[current_url]}[/dim]"),
+        console=console,
+    ) as progress:
+        task = progress.add_task(
+            f"Inspecting ({workers} workers)",
+            total=len(urls),
+            current_url="",
+        )
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_worker, url): url for url in urls}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    status = future.result()
+                except Exception as exc:
+                    status = UrlStatus(url=url, http_error=str(exc))
+                result_map[url] = status
+                short = url.rsplit("/", 1)[-1] or "/"
+                progress.update(task, advance=1, current_url=short[-40:])
 
     return [result_map[url] for url in urls]
 
