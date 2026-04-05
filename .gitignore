@@ -1,0 +1,22 @@
+# Credentials & tokens (NEVER commit)
+token.json
+credentials.json
+client_secret.json
+.env
+
+# Local data
+*.db
+*.sqlite3
+
+# Generated
+open_this.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.venv/
+venv/

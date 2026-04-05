@@ -1,0 +1,13 @@
+{
+  "credentials_file": "credentials.json",
+  "site_url": "sc-domain:YOUR_DOMAIN.com",
+  "sitemap_url": null,
+  "sitemap_local_fallback": null,
+  "cooldown_hours": 48,
+  "indexing_api_enabled": true,
+  "indexnow_enabled": false,
+  "indexnow_key": null,
+  "db_path": "seo_submissions.db",
+  "request_delay_seconds": 1.5,
+  "user_agent": "Google-SEO-Manager/1.0"
+}
