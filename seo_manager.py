@@ -1844,5 +1844,113 @@ def submit(url, credentials, db, indexnow_key):
     tracker.close()
 
 
+@cli.command()
+@click.option("--site", required=True,
+              help="Site URL (e.g. sc-domain:example.com)")
+@click.option("--sitemap", default=None, multiple=True,
+              help="Sitemap URL(s) to submit. Repeatable. Auto-derived if omitted.")
+@click.option("--credentials", default="credentials.json",
+              help="Path to credentials JSON")
+@click.pass_context
+def ping(ctx, site, sitemap, credentials):
+    """Re-submit sitemaps to Google — the fast way to notify about bulk changes.
+
+    \b
+    Uses the Search Console Sitemaps API (PUT sitemaps.submit) to tell Google
+    your sitemap has changed. Google will re-fetch and re-process all URLs.
+    No per-URL quota — one call covers the entire sitemap.
+
+    \b
+    For a major site update this is much faster than the Indexing API
+    (which is limited to 200 URLs/day).
+    """
+    cfg = ctx.obj["config"]
+    credentials = (credentials if credentials != "credentials.json"
+                   else cfg.get("credentials_file", credentials))
+
+    sitemap_urls = list(sitemap) if sitemap else [derive_sitemap_url(site)]
+
+    console.print(Panel(
+        f"[bold]Sitemap Ping — {site}[/bold]",
+        border_style="cyan",
+    ))
+
+    console.print("[bold]Authenticating...[/bold]")
+    try:
+        wm_service = build_webmasters_service(credentials)
+        console.print("  [green]Authenticated[/green]\n")
+    except Exception as e:
+        console.print(f"[red]Auth failed: {e}[/red]")
+        raise SystemExit(1)
+
+    # List currently registered sitemaps
+    try:
+        resp = wm_service.sitemaps().list(siteUrl=site).execute()
+        existing = resp.get("sitemap", [])
+        if existing:
+            console.print("[bold]Currently registered sitemaps:[/bold]")
+            for sm in existing:
+                path = sm.get("path", "?")
+                last = sm.get("lastDownloaded", "never")
+                warnings = sm.get("warnings", "0")
+                errors = sm.get("errors", "0")
+                console.print(
+                    f"  • {path}  "
+                    f"[dim]last fetched: {last}  "
+                    f"warnings: {warnings}  errors: {errors}[/dim]"
+                )
+            console.print()
+    except Exception as e:
+        console.print(f"  [yellow]Could not list existing sitemaps: {e}[/yellow]\n")
+
+    # Submit each sitemap
+    submitted = 0
+    for sm_url in sitemap_urls:
+        console.print(f"  Submitting: [bold]{sm_url}[/bold]")
+        try:
+            wm_service.sitemaps().submit(siteUrl=site, feedpath=sm_url).execute()
+            console.print(f"  [bold green]✓ Submitted[/bold green] — Google will re-fetch this sitemap\n")
+            submitted += 1
+        except Exception as e:
+            console.print(f"  [red]✗ Failed: {e}[/red]\n")
+
+    # Also try to discover sub-sitemaps from the sitemap index and submit those
+    if len(sitemap_urls) == 1:
+        main_sm = sitemap_urls[0]
+        try:
+            r = requests.get(main_sm, headers={"User-Agent": "Google-SEO-Manager/1.0"}, timeout=15)
+            r.raise_for_status()
+            root = ET.fromstring(r.text)
+            sitemapindex_tag = f"{{{SITEMAP_NS['sm']}}}sitemapindex"
+            if root.tag == sitemapindex_tag or root.tag == "sitemapindex":
+                sub_locs = root.findall("sm:sitemap/sm:loc", SITEMAP_NS)
+                if not sub_locs:
+                    sub_locs = root.findall(
+                        "{http://www.sitemaps.org/schemas/sitemap/0.9}sitemap/"
+                        "{http://www.sitemaps.org/schemas/sitemap/0.9}loc"
+                    )
+                if sub_locs:
+                    console.print(f"[bold]Found sitemap index with {len(sub_locs)} sub-sitemaps:[/bold]")
+                    for loc_el in sub_locs:
+                        sub_url = loc_el.text.strip()
+                        console.print(f"  Submitting: [bold]{sub_url}[/bold]")
+                        try:
+                            wm_service.sitemaps().submit(siteUrl=site, feedpath=sub_url).execute()
+                            console.print(f"  [bold green]✓ Submitted[/bold green]\n")
+                            submitted += 1
+                        except Exception as e:
+                            console.print(f"  [red]✗ Failed: {e}[/red]\n")
+        except Exception:
+            pass
+
+    console.print(Panel(
+        f"[bold green]Done — {submitted} sitemap(s) submitted to Google[/bold green]\n\n"
+        "Google will re-fetch and re-process all URLs in these sitemaps.\n"
+        "This typically triggers re-crawling within hours to a few days.\n\n"
+        "[dim]Tip: Make sure your sitemap <lastmod> dates are accurate for changed pages.[/dim]",
+        border_style="green",
+    ))
+
+
 if __name__ == "__main__":
     cli()
