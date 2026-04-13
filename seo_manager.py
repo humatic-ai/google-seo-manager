@@ -36,6 +36,16 @@ from rich.panel import Panel
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn
 from rich.table import Table
 
+# Load .env file if present (secrets like RESEND_API_KEY)
+_env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(_env_path):
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _, _v = _line.partition("=")
+                os.environ.setdefault(_k.strip(), _v.strip())
+
 console = Console()
 
 SITEMAP_NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
@@ -1024,21 +1034,59 @@ def _print_report(results: list[UrlStatus], site_url: str,
 # CLI
 # ---------------------------------------------------------------------------
 
-def load_config(config_path: Optional[str]) -> dict:
-    if config_path and os.path.exists(config_path):
-        with open(config_path) as f:
-            return json.load(f)
-    return {}
+def _env_bool(val: str) -> bool:
+    return val.lower() in ("1", "true", "yes")
+
+
+def load_config() -> dict:
+    """Build config dict from environment variables (loaded from .env at startup)."""
+    cfg: dict = {}
+    _map = {
+        "SEO_SITE_URL": "site_url",
+        "SEO_CREDENTIALS_FILE": "credentials_file",
+        "SEO_SITEMAP_URL": "sitemap_url",
+        "SEO_SITEMAP_LOCAL_FALLBACK": "sitemap_local_fallback",
+        "SEO_DB_PATH": "db_path",
+        "SEO_USER_AGENT": "user_agent",
+        "SEO_INDEXNOW_KEY": "indexnow_key",
+        "RESEND_API_KEY": "resend_api_key",
+    }
+    for env_key, cfg_key in _map.items():
+        v = os.environ.get(env_key)
+        if v:
+            cfg[cfg_key] = v
+
+    _num_map = {
+        "SEO_COOLDOWN_HOURS": ("cooldown_hours", int),
+        "SEO_REQUEST_DELAY": ("request_delay_seconds", float),
+    }
+    for env_key, (cfg_key, typ) in _num_map.items():
+        v = os.environ.get(env_key)
+        if v:
+            cfg[cfg_key] = typ(v)
+
+    _bool_map = {
+        "SEO_INDEXING_API_ENABLED": "indexing_api_enabled",
+        "SEO_INDEXNOW_ENABLED": "indexnow_enabled",
+    }
+    for env_key, cfg_key in _bool_map.items():
+        v = os.environ.get(env_key)
+        if v is not None:
+            cfg[cfg_key] = _env_bool(v)
+
+    email_to = os.environ.get("SEO_EMAIL_TO")
+    if email_to:
+        cfg["email_to"] = [e.strip() for e in email_to.split(",") if e.strip()]
+
+    return cfg
 
 
 @click.group()
-@click.option("--config", "config_path", default=None,
-              help="Path to config JSON file")
 @click.pass_context
-def cli(ctx, config_path):
+def cli(ctx):
     """Google SEO Manager — works with any Google Search Console property."""
     ctx.ensure_object(dict)
-    ctx.obj["config"] = load_config(config_path)
+    ctx.obj["config"] = load_config()
 
 
 def _run_cmd(cmd: list[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
@@ -1950,6 +1998,444 @@ def ping(ctx, site, sitemap, credentials):
         "[dim]Tip: Make sure your sitemap <lastmod> dates are accurate for changed pages.[/dim]",
         border_style="green",
     ))
+
+
+# ---------------------------------------------------------------------------
+# Apache Log Googlebot Analysis
+# ---------------------------------------------------------------------------
+
+APACHE_LOG_DIR = "/opt/bitnami/apache2/logs"
+_GOOGLEBOT_RE = re.compile(r"Googlebot", re.IGNORECASE)
+_COMBINED_RE = re.compile(
+    r'^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+"(\S+)\s+(\S+)\s+\S+"\s+(\d+)\s+(\S+)\s+"([^"]*)"\s+"([^"]*)"'
+)
+
+
+@dataclass
+class BotHit:
+    ip: str
+    date: str
+    method: str
+    path: str
+    status: int
+    referer: str
+    user_agent: str
+
+
+def parse_apache_googlebot_hits(log_path: str, days: int = 7) -> list[BotHit]:
+    """Parse Apache combined-format log for Googlebot hits within the last N days."""
+    hits: list[BotHit] = []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    if not os.path.exists(log_path):
+        return hits
+
+    with open(log_path) as f:
+        for line in f:
+            if "Googlebot" not in line and "googlebot" not in line:
+                continue
+            m = _COMBINED_RE.match(line)
+            if not m:
+                continue
+            ip, date_str, method, path, status_str, _, referer, ua = m.groups()
+            if not _GOOGLEBOT_RE.search(ua):
+                continue
+            try:
+                dt = datetime.strptime(date_str.split()[0], "%d/%b/%Y:%H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+            except ValueError:
+                dt = datetime.now(timezone.utc)
+            if dt >= cutoff:
+                hits.append(BotHit(
+                    ip=ip, date=date_str, method=method, path=path,
+                    status=int(status_str), referer=referer, user_agent=ua,
+                ))
+    return hits
+
+
+def _analyze_bot_hits(hits: list[BotHit]) -> dict:
+    """Summarize Googlebot hits into a report dict."""
+    if not hits:
+        return {
+            "total_hits": 0,
+            "unique_pages": 0,
+            "status_breakdown": {},
+            "top_pages": [],
+            "daily_counts": {},
+            "crawl_types": {},
+        }
+
+    status_counts: dict[int, int] = defaultdict(int)
+    page_counts: dict[str, int] = defaultdict(int)
+    daily_counts: dict[str, int] = defaultdict(int)
+    crawl_types: dict[str, int] = defaultdict(int)
+
+    for h in hits:
+        status_counts[h.status] += 1
+        page_counts[h.path] += 1
+        day = h.date.split(":")[0]
+        daily_counts[day] += 1
+        if "Googlebot-Image" in h.user_agent:
+            crawl_types["Image"] += 1
+        elif "Googlebot-Video" in h.user_agent:
+            crawl_types["Video"] += 1
+        elif "Googlebot-News" in h.user_agent:
+            crawl_types["News"] += 1
+        elif "Googlebot/2.1" in h.user_agent:
+            crawl_types["Web"] += 1
+        elif "Storebot-Google" in h.user_agent:
+            crawl_types["Shopping"] += 1
+        elif "APIs-Google" in h.user_agent:
+            crawl_types["APIs"] += 1
+        else:
+            crawl_types["Other"] += 1
+
+    top_pages = sorted(page_counts.items(), key=lambda x: -x[1])[:20]
+
+    return {
+        "total_hits": len(hits),
+        "unique_pages": len(page_counts),
+        "status_breakdown": dict(sorted(status_counts.items())),
+        "top_pages": top_pages,
+        "daily_counts": dict(sorted(daily_counts.items())),
+        "crawl_types": dict(sorted(crawl_types.items(), key=lambda x: -x[1])),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Email Report (Resend)
+# ---------------------------------------------------------------------------
+
+RESEND_API_URL = "https://api.resend.com/emails"
+
+
+def _build_report_html(
+    results: list[UrlStatus],
+    site_url: str,
+    bot_analysis: dict,
+    submitted_count: int = 0,
+    run_date: Optional[str] = None,
+) -> str:
+    """Build an HTML email report summarizing SEO status + Googlebot log analysis."""
+    base_url = derive_base_url(site_url)
+    date_str = run_date or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    errors = [s for s in results if s.action in ("ERROR", "WARN_NOINDEX", "WARN_BLOCKED")]
+    submittable = [s for s in results if s.action == "SUBMIT"]
+    ok_list = [s for s in results if s.action == "OK"]
+    skipped = [s for s in results if s.action == "SKIP_RECENT"]
+
+    def _short(url: str) -> str:
+        return url.replace(base_url, "") or "/"
+
+    indexed_pct = round(len(ok_list) / len(results) * 100) if results else 0
+
+    # Status color helpers
+    def _status_color(n: int, label: str) -> str:
+        if n == 0:
+            return f'<span style="color:#22c55e;">{n} {label}</span>'
+        if "error" in label.lower():
+            return f'<span style="color:#ef4444;font-weight:600;">{n} {label}</span>'
+        return f'<span style="color:#f59e0b;">{n} {label}</span>'
+
+    # Bot analysis section
+    bot_html = ""
+    if bot_analysis["total_hits"] > 0:
+        status_parts = " &middot; ".join(
+            f"HTTP {k}: {v}" for k, v in bot_analysis["status_breakdown"].items()
+        )
+        type_parts = " &middot; ".join(
+            f"{k}: {v}" for k, v in bot_analysis["crawl_types"].items()
+        )
+        top_pages_rows = ""
+        for path, count in bot_analysis["top_pages"][:10]:
+            top_pages_rows += f"<tr><td style='padding:4px 12px 4px 0;font-size:13px;color:#374151;'>{path}</td><td style='padding:4px 0;font-size:13px;color:#6b7280;text-align:right;'>{count}</td></tr>"
+
+        bot_html = f"""
+    <tr><td style="padding:24px 32px 0 32px;">
+      <h2 style="margin:0;font-size:18px;font-weight:700;color:#111827;">Googlebot Activity (7 days)</h2>
+    </td></tr>
+    <tr><td style="padding:12px 32px 0 32px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f0fdf4;border-radius:8px;padding:16px;">
+        <tr><td style="padding:12px 16px;">
+          <p style="margin:0 0 8px 0;font-size:15px;color:#111827;"><strong>{bot_analysis['total_hits']}</strong> requests &middot; <strong>{bot_analysis['unique_pages']}</strong> unique pages</p>
+          <p style="margin:0 0 4px 0;font-size:13px;color:#6b7280;">Status: {status_parts}</p>
+          <p style="margin:0;font-size:13px;color:#6b7280;">Types: {type_parts}</p>
+        </td></tr>
+      </table>
+    </td></tr>
+    <tr><td style="padding:16px 32px 0 32px;">
+      <p style="margin:0 0 8px 0;font-size:14px;font-weight:600;color:#374151;">Top crawled pages:</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%">{top_pages_rows}</table>
+    </td></tr>"""
+    else:
+        bot_html = """
+    <tr><td style="padding:24px 32px 0 32px;">
+      <h2 style="margin:0;font-size:18px;font-weight:700;color:#111827;">Googlebot Activity (7 days)</h2>
+    </td></tr>
+    <tr><td style="padding:12px 32px 0 32px;">
+      <p style="margin:0;font-size:14px;color:#9ca3af;">No Googlebot hits detected in Apache logs. This may be because the log format was recently switched to combined, or Cloudflare is absorbing all bot traffic before it reaches the origin.</p>
+    </td></tr>"""
+
+    # Error detail rows
+    error_rows = ""
+    if errors:
+        for s in errors[:10]:
+            reason = s.action_reason or _get_error_explanation(s) or "Unknown"
+            error_rows += f"<tr><td style='padding:4px 12px 4px 0;font-size:13px;color:#ef4444;'>{_short(s.url)}</td><td style='padding:4px 0;font-size:13px;color:#6b7280;'>{reason[:60]}</td></tr>"
+        if len(errors) > 10:
+            error_rows += f"<tr><td colspan='2' style='padding:4px 0;font-size:13px;color:#9ca3af;'>... and {len(errors) - 10} more</td></tr>"
+
+    error_section = ""
+    if errors:
+        error_section = f"""
+    <tr><td style="padding:20px 32px 0 32px;">
+      <h3 style="margin:0 0 8px 0;font-size:15px;font-weight:600;color:#ef4444;">Errors ({len(errors)})</h3>
+      <table role="presentation" cellpadding="0" cellspacing="0" width="100%">{error_rows}</table>
+    </td></tr>"""
+
+    return f"""\
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background-color:#f4f4f7;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f7;padding:40px 16px;">
+<tr><td align="center">
+
+<table role="presentation" width="560" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.06);">
+
+  <tr>
+    <td align="center" style="padding:36px 32px 0 32px;">
+      <img src="https://humaticai.com/logo.png" alt="HumaticAI" width="48" height="48" style="display:block;border:0;border-radius:10px;" />
+    </td>
+  </tr>
+
+  <tr>
+    <td align="center" style="padding:20px 32px 0 32px;">
+      <h1 style="margin:0;font-size:22px;font-weight:700;color:#111827;letter-spacing:-0.3px;">Weekly SEO Report</h1>
+      <p style="margin:8px 0 0 0;font-size:13px;color:#9ca3af;">{date_str} &middot; {site_url}</p>
+    </td>
+  </tr>
+
+  <!-- Summary Cards -->
+  <tr><td style="padding:24px 32px 0 32px;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        <td width="25%" align="center" style="padding:16px 4px;background:#f0fdf4;border-radius:8px;">
+          <div style="font-size:28px;font-weight:700;color:#22c55e;">{len(ok_list)}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:4px;">Indexed</div>
+        </td>
+        <td width="4px"></td>
+        <td width="25%" align="center" style="padding:16px 4px;background:#eff6ff;border-radius:8px;">
+          <div style="font-size:28px;font-weight:700;color:#3b82f6;">{len(submittable)}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:4px;">Pending</div>
+        </td>
+        <td width="4px"></td>
+        <td width="25%" align="center" style="padding:16px 4px;background:#fef3c7;border-radius:8px;">
+          <div style="font-size:28px;font-weight:700;color:#f59e0b;">{len(skipped)}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:4px;">Awaiting</div>
+        </td>
+        <td width="4px"></td>
+        <td width="25%" align="center" style="padding:16px 4px;background:#fef2f2;border-radius:8px;">
+          <div style="font-size:28px;font-weight:700;color:#ef4444;">{len(errors)}</div>
+          <div style="font-size:11px;color:#6b7280;margin-top:4px;">Errors</div>
+        </td>
+      </tr>
+    </table>
+  </td></tr>
+
+  <tr><td align="center" style="padding:16px 32px 0 32px;">
+    <p style="margin:0;font-size:15px;color:#374151;"><strong>{indexed_pct}%</strong> indexed ({len(ok_list)}/{len(results)} URLs){f' &middot; {submitted_count} submitted this run' if submitted_count else ''}</p>
+  </td></tr>
+
+  {error_section}
+
+  {bot_html}
+
+  <tr><td style="padding:32px 32px 0 32px;">
+    <div style="height:1px;background-color:#f3f4f6;"></div>
+  </td></tr>
+
+  <tr>
+    <td align="center" style="padding:20px 32px 32px 32px;">
+      <p style="margin:0;font-size:11px;color:#9ca3af;">
+        Generated by <a href="https://github.com/humatic-ai/google-seo-manager" style="color:#6366f1;text-decoration:none;">google-seo-manager</a>
+        &middot; &copy; HumaticAI
+      </p>
+    </td>
+  </tr>
+
+</table>
+
+</td></tr>
+</table>
+
+</body>
+</html>"""
+
+
+def send_report_email(
+    resend_api_key: str,
+    to_emails: list[str],
+    subject: str,
+    html: str,
+    from_email: str = "SEO Monitor <noreply@humaticai.com>",
+) -> bool:
+    """Send an email via Resend HTTP API. Returns True on success."""
+    resp = requests.post(
+        RESEND_API_URL,
+        headers={
+            "Authorization": f"Bearer {resend_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "from": from_email,
+            "to": to_emails,
+            "subject": subject,
+            "html": html,
+        },
+        timeout=30,
+    )
+    return resp.status_code in (200, 201)
+
+
+# ---------------------------------------------------------------------------
+# Weekly Report CLI Command
+# ---------------------------------------------------------------------------
+
+@cli.command("weekly-report")
+@click.option("--site", required=True, help="Site URL (e.g. sc-domain:example.com)")
+@click.option("--sitemap", default=None, help="Sitemap URL (auto-derived from --site)")
+@click.option("--submit", "do_submit", is_flag=True,
+              help="Also submit eligible pages for indexing")
+@click.option("--credentials", default="credentials.json", help="Path to credentials JSON")
+@click.option("--cooldown", type=int, default=DEFAULT_COOLDOWN_HOURS)
+@click.option("--workers", type=int, default=5)
+@click.option("--db", default="seo_submissions.db")
+@click.option("--email-to", multiple=True, required=True,
+              help="Recipient email(s). Repeatable.")
+@click.option("--resend-api-key", "resend_key", default=None, envvar="RESEND_API_KEY",
+              help="Resend API key (or set RESEND_API_KEY env var)")
+@click.option("--log-dir", default=APACHE_LOG_DIR,
+              help="Apache log directory for Googlebot analysis")
+@click.option("--log-days", type=int, default=7,
+              help="Days of Apache logs to analyze")
+@click.pass_context
+def weekly_report(ctx, site, sitemap, do_submit, credentials, cooldown,
+                  workers, db, email_to, resend_key, log_dir, log_days):
+    """Run SEO check + Googlebot log analysis, then email a summary report.
+
+    \b
+    Designed for cron. Combines:
+      1. GSC URL inspection (same as 'check')
+      2. Apache access_log Googlebot analysis
+      3. HTML email report via Resend
+
+    \b
+    Example (cron, every Monday 8 AM UTC):
+      0 8 * * 1 cd /home/bitnami/google-seo-manager && \\
+        python3 seo_manager.py weekly-report \\
+        --site "sc-domain:humaticai.com" --email-to you@example.com
+    """
+    cfg = ctx.obj["config"]
+    credentials = (credentials if credentials != "credentials.json"
+                   else cfg.get("credentials_file", credentials))
+    sitemap_url = sitemap or derive_sitemap_url(site)
+    user_agent = cfg.get("user_agent", "Google-SEO-Manager/1.0")
+    resend_key = resend_key or cfg.get("resend_api_key")
+
+    if not resend_key:
+        console.print("[red]RESEND_API_KEY required. Set it in .env, pass --resend-api-key, or set the env var.[/red]")
+        raise SystemExit(1)
+
+    to_list = list(email_to) or cfg.get("email_to", [])
+    if not to_list:
+        console.print("[red]At least one --email-to address is required.[/red]")
+        raise SystemExit(1)
+
+    console.print(Panel(
+        f"[bold]Weekly SEO Report — {site}[/bold]",
+        border_style="cyan",
+    ))
+
+    # --- Step 1: GSC Inspection ---
+    console.print("[bold]1. Authenticating with Google APIs...[/bold]")
+    try:
+        creds_check = _resolve_credentials(credentials)
+        if creds_check is None:
+            raise RuntimeError("No valid credentials found. Run 'setup' first.")
+        indexing_service = build_indexing_service(credentials) if do_submit else None
+        console.print("  [green]Authenticated[/green]")
+    except Exception as e:
+        console.print(f"[red]Auth failed: {e}[/red]")
+        raise SystemExit(1)
+
+    tracker = SubmissionTracker(db)
+
+    console.print("\n[bold]2. Fetching sitemap...[/bold]")
+    urls = fetch_sitemap(sitemap_url, user_agent=user_agent)
+    if not urls:
+        console.print("[red]No URLs found in sitemap.[/red]")
+        raise SystemExit(1)
+    console.print(f"  Found {len(urls)} URLs")
+
+    console.print(f"\n[bold]3. Inspecting URLs ({workers} workers)...[/bold]")
+    statuses = _inspect_urls_parallel(urls, site, credentials, user_agent, workers=workers)
+
+    base_url = derive_base_url(site)
+    results: list[UrlStatus] = []
+    submitted_count = 0
+
+    for status in statuses:
+        action, reason = decide_action(status, tracker, cooldown)
+        status.action = action
+        status.action_reason = reason
+
+        if do_submit and action == "SUBMIT" and indexing_service:
+            try:
+                submit_to_google_indexing(indexing_service, status.url)
+                status.last_submitted_at = datetime.now(timezone.utc).isoformat()
+                submitted_count += 1
+                tracker.record_submission(status.url)
+            except Exception as e:
+                short = status.url.replace(base_url, "") or "/"
+                console.print(f"  [red]Submit error ({short}): {e}[/red]")
+
+        tracker.upsert(status)
+        results.append(status)
+
+    # --- Step 2: Apache Log Analysis ---
+    console.print(f"\n[bold]4. Analyzing Apache logs for Googlebot ({log_days} days)...[/bold]")
+    log_path = os.path.join(log_dir, "access_log")
+    bot_hits = parse_apache_googlebot_hits(log_path, days=log_days)
+    bot_analysis = _analyze_bot_hits(bot_hits)
+    console.print(f"  Googlebot hits: {bot_analysis['total_hits']} ({bot_analysis['unique_pages']} unique pages)")
+
+    # --- Step 3: Print console report ---
+    _print_report(results, site, submitted_count=submitted_count, did_submit=do_submit)
+
+    # --- Step 4: Send email ---
+    console.print(f"\n[bold]5. Sending email report to {', '.join(to_list)}...[/bold]")
+    run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    html = _build_report_html(results, site, bot_analysis,
+                              submitted_count=submitted_count, run_date=run_date)
+
+    ok_count = sum(1 for r in results if r.action == "OK")
+    err_count = sum(1 for r in results if r.action in ("ERROR", "WARN_NOINDEX", "WARN_BLOCKED"))
+    subject = f"SEO Report: {ok_count} indexed, {err_count} errors — humaticai.com ({run_date.split()[0]})"
+
+    try:
+        ok = send_report_email(resend_key, to_list, subject, html)
+        if ok:
+            console.print("  [bold green]Email sent successfully[/bold green]")
+        else:
+            console.print("  [red]Email send failed (non-200 response from Resend)[/red]")
+    except Exception as e:
+        console.print(f"  [red]Email error: {e}[/red]")
+
+    console.print(f"\n  DB saved to: {db}")
+    tracker.close()
 
 
 if __name__ == "__main__":

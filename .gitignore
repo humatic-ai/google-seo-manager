@@ -3,6 +3,7 @@ token.json
 credentials.json
 client_secret.json
 .env
+config.json
 
 # Local data
 *.db
